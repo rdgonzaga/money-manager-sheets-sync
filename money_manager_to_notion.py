@@ -50,14 +50,14 @@ def get_menu_choice() -> str:
     """Get validated menu choice from user."""
     while True:
         try:
-            choice = input("\nSelect an operation (1-4): ").strip()
-            if choice in ('1', '2', '3', '4'):
+            choice = input("\nSelect an operation (1-5): ").strip()
+            if choice in ('1', '2', '3', '4', '5'):
                 return choice
             else:
-                print("[ERROR] Invalid selection. Please enter a number between 1 and 4.")
+                print("[ERROR] Invalid selection. Please enter a number between 1 and 5.")
         except KeyboardInterrupt:
             print("\n[INFO] Operation cancelled by user.")
-            return '4'
+            return '5'
         except Exception as e:
             print(f"[ERROR] Unexpected input error: {e}")
             print("[INFO] Please try again.")
@@ -120,6 +120,7 @@ def extract_sql(db_path: str, last_sync: float = None) -> pd.DataFrame:
     query = """
         SELECT 
             t.ZDATE as timestamp,
+            t.ZDO_TYPE as type,
             t.ZAMOUNT as amount,
             a.ZNICNAME as account_name,
             c.ZNAME as category_name,
@@ -154,6 +155,10 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     df['note'] = df['note'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Untitled Transaction')
     df['category_name'] = df['category_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Uncategorized')
     df['account_name'] = df['account_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Unknown Account')
+    
+    # Map transaction type (0 = Income, 1 = Expense)
+    type_map = {'0': 'Income', '1': 'Expense'}
+    df['type'] = df['type'].astype(str).map(type_map).fillna('Other')
     
     df['amount'] = df['amount'].abs() 
     return df
@@ -217,22 +222,53 @@ def export_to_csv(df: pd.DataFrame):
     
     df_csv['date'] = df_csv['date'].dt.strftime('%Y-%m-%d %H:%M')
     
+    # Rename columns to match Google Sheets format
     df_csv = df_csv.rename(columns={
-        'note': 'Transaction',
-        'amount': 'Amount',
-        'category_name': 'Category',
-        'account_name': 'Account',
-        'date': 'Date'
+        'date': 'DATE',
+        'type': 'TYPE',
+        'account_name': 'ACCOUNT',
+        'category_name': 'CATEGORY',
+        'amount': 'AMOUNT',
+        'note': 'DETAILS / NAME'
     })
+    
+    # Reorder columns
+    column_order = ['DATE', 'TYPE', 'ACCOUNT', 'CATEGORY', 'AMOUNT', 'DETAILS / NAME']
+    df_csv = df_csv[column_order]
+    
     filename = "Notion_Initial_Load.csv"
     
     try:
         df_csv.to_csv(filename, index=False)
         print(f"[SUCCESS] Exported {len(df_csv)} records to {filename}")
-        print("[INFO] Next Step: Upload via Notion's 'Merge with CSV' feature.")
+        print("[INFO] Next Step: Upload via Notion's 'Merge with CSV' feature or import to Google Sheets.")
         return True
     except Exception as e:
         print(f"[ERROR] CSV export failed: {e}")
+        return False
+
+def export_setup_data(df: pd.DataFrame):
+    """Export unique Types, Accounts, and Categories for Sheet setup."""
+    types = sorted(df['type'].unique())
+    accounts = sorted(df['account_name'].unique())
+    categories = sorted(df['category_name'].unique())
+    
+    # Pad lists to the same length to create a DataFrame
+    max_len = max(len(types), len(accounts), len(categories))
+    
+    setup_df = pd.DataFrame({
+        'UNIQUE TYPES': types + [''] * (max_len - len(types)),
+        'UNIQUE ACCOUNTS': accounts + [''] * (max_len - len(accounts)),
+        'UNIQUE CATEGORIES': categories + [''] * (max_len - len(categories))
+    })
+    
+    filename = "Sheet_Setup_Data.csv"
+    try:
+        setup_df.to_csv(filename, index=False)
+        print(f"[SUCCESS] Exported unique lists to {filename}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Setup data export failed: {e}")
         return False
 
 # ----------------- CLI MENU -----------------
@@ -251,7 +287,9 @@ def main():
     print("   - Queries and pushes only new transactions since the last sync.")
     print("\n3. Reset Sync State")
     print("   - Deletes the local state file. Resets the pipeline to zero.")
-    print("\n4. Exit")
+    print("\n4. Export Sheet Setup Data")
+    print("   - Extracts unique Types, Accounts, and Categories for Sheet setup.")
+    print("\n5. Exit")
     print("="*50)
 
     choice = get_menu_choice()
@@ -310,6 +348,15 @@ def main():
             print(f"[ERROR] Failed to reset sync state: {e}")
 
     elif choice == '4':
+        print("\n[INFO] Exporting Sheet Setup Data...")
+        raw_df = extract_sql(DB_PATH)
+        if not raw_df.empty:
+            clean_df = transform_data(raw_df)
+            export_setup_data(clean_df)
+        else:
+            print("[ERROR] No data extracted from database.")
+
+    elif choice == '5':
         print("[INFO] Exiting pipeline.")
 
 if __name__ == "__main__":
