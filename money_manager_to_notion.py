@@ -103,13 +103,15 @@ def extract_sql(db_path: str, last_sync: float = None) -> pd.DataFrame:
             t.ZDO_TYPE as type,
             t.ZAMOUNT as amount,
             a.ZNICNAME as account_name,
+            target.ZNICNAME as to_account_name,
             c.ZNAME as category_name,
             t.ZCONTENT as note
         FROM ZINOUTCOME t
         LEFT JOIN ZASSET a ON t.ZASSETUID = a.ZUID
+        LEFT JOIN ZASSET target ON t.ZTOASSETUID = target.ZUID
         LEFT JOIN ZCATEGORY c ON t.ZCATEGORYUID = c.ZUID
         WHERE (t.ZISDEL = 0 OR t.ZISDEL IS NULL)
-        AND t.ZDO_TYPE IN ('0', '1')
+        AND t.ZDO_TYPE IN ('0', '1', '3', '4')
     """
     
     if last_sync:
@@ -131,14 +133,36 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     
     df['date'] = pd.to_datetime(df['timestamp'] + 978307200, unit='s', errors='coerce')
     df['date'] = df['date'].dt.tz_localize('UTC').dt.tz_convert('Asia/Manila')
+    
     df['note'] = df['note'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Untitled Transaction')
+    
+    is_transfer = df['type'].astype(str).isin(['3', '4'])
+    df.loc[is_transfer, 'category_name'] = 'Transfer'
+    
+    def enrich_transfer_note(row):
+        other_acc = str(row['to_account_name']).strip()
+        if other_acc in ['', 'None', 'nan']:
+            other_acc = "Unknown Account"
+            
+        if str(row['type']) == '3':
+            return f"To: {other_acc} | {row['note']}"
+        if str(row['type']) == '4':
+            return f"From: {other_acc} | {row['note']}"
+        return row['note']
+    
+    df.loc[is_transfer, 'note'] = df[is_transfer].apply(enrich_transfer_note, axis=1)
+    
     df['category_name'] = df['category_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Uncategorized')
     df['account_name'] = df['account_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Unknown Account')
     
-    type_map = {'0': 'Income', '1': 'Expense'}
+    type_map = {'0': 'Income', '1': 'Expense', '3': 'Transfer', '4': 'Transfer'}
     df['type'] = df['type'].astype(str).map(type_map).fillna('Other')
     
     df['amount'] = df['amount'].abs() 
+    
+    if 'to_account_name' in df.columns:
+        df = df.drop(columns=['to_account_name'])
+        
     return df
 
 def export_to_csv(df: pd.DataFrame, filename: str = "Money_Manager_Export.csv"):
