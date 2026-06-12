@@ -4,14 +4,11 @@ import pandas as pd
 from dotenv import load_dotenv
 import time
 
-# ----------------- CONFIGURATION -----------------
 load_dotenv()
 DB_PATH = os.getenv("MM_DB_PATH")
 STATE_FILE = ".sync_state" 
 
-# --------- VALIDATION & ERROR CHECKING ---------
 def validate_environment():
-    """Validate required environment variables are set."""
     errors = []
     
     if not DB_PATH:
@@ -26,7 +23,6 @@ def validate_environment():
     return True
 
 def get_yes_no_input(prompt: str) -> bool:
-    """Get validated yes/no input from user."""
     while True:
         response = input(prompt).strip().lower()
         if response in ('y', 'yes'):
@@ -37,7 +33,6 @@ def get_yes_no_input(prompt: str) -> bool:
             print("[ERROR] Invalid input. Please enter 'y' or 'n'.")
 
 def get_menu_choice() -> str:
-    """Get validated menu choice from user."""
     while True:
         try:
             choice = input("\nSelect an operation (1-5): ").strip()
@@ -52,9 +47,7 @@ def get_menu_choice() -> str:
             print(f"[ERROR] Unexpected input error: {e}")
             print("[INFO] Please try again.")
 
-# ----------------- STATE MANAGEMENT -----------------
 def get_last_sync_timestamp() -> float:
-    """Retrieve the last sync timestamp from state file."""
     if not os.path.exists(STATE_FILE):
         return None
     
@@ -72,7 +65,6 @@ def get_last_sync_timestamp() -> float:
         return None
 
 def update_sync_timestamp(new_timestamp: float):
-    """Save the sync timestamp to state file."""
     if not isinstance(new_timestamp, (int, float)):
         print(f"[ERROR] Invalid timestamp value: {new_timestamp}")
         return False
@@ -85,9 +77,7 @@ def update_sync_timestamp(new_timestamp: float):
         print(f"[ERROR] Failed to write state file: {e}")
         return False
 
-# ----------------- EXTRACT -----------------
 def extract_sql(db_path: str, last_sync: float = None) -> pd.DataFrame:
-    """Extract transaction data from Money Manager database."""
     if not db_path:
         print("[ERROR] Database path not provided. Check MM_DB_PATH in .env file.")
         return pd.DataFrame()
@@ -136,7 +126,6 @@ def extract_sql(db_path: str, last_sync: float = None) -> pd.DataFrame:
         print(f"[ERROR] Database connection failed: {e}")
         return pd.DataFrame()
 
-# ----------------- TRANSFORM -----------------
 def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     
@@ -146,20 +135,17 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     df['category_name'] = df['category_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Uncategorized')
     df['account_name'] = df['account_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Unknown Account')
     
-    # Map transaction type (0 = Income, 1 = Expense)
     type_map = {'0': 'Income', '1': 'Expense'}
     df['type'] = df['type'].astype(str).map(type_map).fillna('Other')
     
     df['amount'] = df['amount'].abs() 
     return df
 
-# ----------------- EXPORT (CSV) -----------------
 def export_to_csv(df: pd.DataFrame, filename: str = "Money_Manager_Export.csv"):
     df_csv = df.drop(columns=['timestamp'])
     
     df_csv['date'] = df_csv['date'].dt.strftime('%Y-%m-%d %H:%M')
     
-    # Rename columns to match Google Sheets format
     df_csv = df_csv.rename(columns={
         'date': 'DATE',
         'type': 'TYPE',
@@ -169,7 +155,6 @@ def export_to_csv(df: pd.DataFrame, filename: str = "Money_Manager_Export.csv"):
         'note': 'DETAILS / NAME'
     })
     
-    # Reorder columns
     column_order = ['DATE', 'TYPE', 'ACCOUNT', 'CATEGORY', 'AMOUNT', 'DETAILS / NAME']
     df_csv = df_csv[column_order]
     
@@ -183,12 +168,10 @@ def export_to_csv(df: pd.DataFrame, filename: str = "Money_Manager_Export.csv"):
         return False
 
 def export_setup_data(df: pd.DataFrame):
-    """Export unique Types, Accounts, and Categories for Sheet setup."""
-    types = sorted(df['type'].unique())
-    accounts = sorted(df['account_name'].unique())
-    categories = sorted(df['category_name'].unique())
+    types = sorted([str(x) for x in df['type'].unique() if pd.notna(x)])
+    accounts = sorted([str(x) for x in df['account_name'].unique() if pd.notna(x)])
+    categories = sorted([str(x) for x in df['category_name'].unique() if pd.notna(x)])
     
-    # Pad lists to the same length to create a DataFrame
     max_len = max(len(types), len(accounts), len(categories))
     
     setup_df = pd.DataFrame({
@@ -206,9 +189,7 @@ def export_setup_data(df: pd.DataFrame):
         print(f"[ERROR] Setup data export failed: {e}")
         return False
 
-# ----------------- CLI MENU -----------------
 def main():
-    # Validate environment before starting
     if not validate_environment():
         return
     
