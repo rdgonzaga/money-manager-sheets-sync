@@ -2,28 +2,18 @@ import os
 import sqlite3
 import pandas as pd
 from dotenv import load_dotenv
-from notion_client import Client
-from notion_client.errors import APIResponseError
 import time
 
 # ----------------- CONFIGURATION -----------------
 load_dotenv()
-NOTION_TOKEN = os.getenv("NOTION_API_KEY")
-FINANCE_DB_ID = os.getenv("NOTION_FINANCE_DB_ID")
 DB_PATH = os.getenv("MM_DB_PATH")
 STATE_FILE = ".sync_state" 
-
-notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
 # --------- VALIDATION & ERROR CHECKING ---------
 def validate_environment():
     """Validate required environment variables are set."""
     errors = []
     
-    if not NOTION_TOKEN:
-        errors.append("NOTION_API_KEY not found in .env file")
-    if not FINANCE_DB_ID:
-        errors.append("NOTION_FINANCE_DB_ID not found in .env file")
     if not DB_PATH:
         errors.append("MM_DB_PATH not found in .env file")
     
@@ -163,61 +153,8 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     df['amount'] = df['amount'].abs() 
     return df
 
-# ----------------- LOAD (API) -----------------
-def load_to_notion(df: pd.DataFrame, database_id: str):
-    """Upload transformed data to Notion database."""
-    if not isinstance(df, pd.DataFrame):
-        print(f"[ERROR] Expected DataFrame, got {type(df).__name__}")
-        return False
-    
-    if not database_id:
-        print("[ERROR] Database ID not provided. Check NOTION_FINANCE_DB_ID in .env file.")
-        return False
-    
-    if not isinstance(database_id, str):
-        print(f"[ERROR] Database ID must be a string, got {type(database_id).__name__}")
-        return False
-    
-    if not notion:
-        print("[ERROR] Notion API token is missing or invalid.")
-        return False
-
-    if df.empty:
-        print("[WARNING] No records to sync.")
-        return True
-    
-    print(f"[INFO] Initiating API sync for {len(df)} records...")
-    for index, row in df.iterrows():
-        payload = {
-            "parent": {"database_id": database_id},
-            "properties": {
-                "Transaction": {"title": [{"text": {"content": str(row['note'])}}]},
-                "Amount": {"number": float(row['amount'])},
-                "Category": {"select": {"name": str(row['category_name'])}},
-                "Account": {"select": {"name": str(row['account_name'])}},
-                "Date": {"date": {"start": row['date'].isoformat()}}
-            }
-        }
-        try:
-            notion.pages.create(**payload)
-            print(f"[SUCCESS] Synced: {row['date']} | {row['amount']} | {row['account_name']}")
-        except APIResponseError as e:
-            if e.code == "rate_limited":
-                print("[WARNING] Rate limit encountered. Pausing execution for 5 seconds...")
-                time.sleep(5)
-                try:
-                    notion.pages.create(**payload)
-                except APIResponseError as retry_error:
-                    print(f"[ERROR] Retry failed on row {index}: {retry_error}")
-            else:
-                print(f"[ERROR] API failure on row {index}: {e}")
-        except Exception as e:
-            print(f"[ERROR] Unexpected error on row {index}: {e}")
-    
-    return True
-
 # ----------------- EXPORT (CSV) -----------------
-def export_to_csv(df: pd.DataFrame):
+def export_to_csv(df: pd.DataFrame, filename: str = "Money_Manager_Export.csv"):
     df_csv = df.drop(columns=['timestamp'])
     
     df_csv['date'] = df_csv['date'].dt.strftime('%Y-%m-%d %H:%M')
@@ -236,12 +173,10 @@ def export_to_csv(df: pd.DataFrame):
     column_order = ['DATE', 'TYPE', 'ACCOUNT', 'CATEGORY', 'AMOUNT', 'DETAILS / NAME']
     df_csv = df_csv[column_order]
     
-    filename = "Notion_Initial_Load.csv"
-    
     try:
         df_csv.to_csv(filename, index=False)
         print(f"[SUCCESS] Exported {len(df_csv)} records to {filename}")
-        print("[INFO] Next Step: Upload via Notion's 'Merge with CSV' feature or import to Google Sheets.")
+        print("[INFO] Next Step: Import this file into your Google Sheets budget tracker.")
         return True
     except Exception as e:
         print(f"[ERROR] CSV export failed: {e}")
@@ -278,13 +213,13 @@ def main():
         return
     
     print("\n" + "="*50)
-    print(" Money Manager to Notion ETL Pipeline")
+    print(" Money Manager to Google Sheets ETL Pipeline")
     print("="*50)
-    print("1. Initial Setup (CSV Export)")
-    print("   - Extracts full historical data to CSV for bulk Notion upload.")
-    print("   - Establishes the initial high-water mark for future syncs.")
-    print("\n2. Incremental Sync (Notion API)")
-    print("   - Queries and pushes only new transactions since the last sync.")
+    print("1. Full History Export (CSV)")
+    print("   - Extracts full historical data to CSV for initial setup.")
+    print("   - Establishes the sync state to track new records.")
+    print("\n2. New Transactions Export (CSV)")
+    print("   - Extracts only new transactions since the last run.")
     print("\n3. Reset Sync State")
     print("   - Deletes the local state file. Resets the pipeline to zero.")
     print("\n4. Export Sheet Setup Data")
@@ -295,11 +230,11 @@ def main():
     choice = get_menu_choice()
 
     if choice == '1':
-        print("\n[INFO] Executing Initial CSV Setup...")
+        print("\n[INFO] Executing Full History Export...")
         raw_df = extract_sql(DB_PATH)
         if not raw_df.empty:
             clean_df = transform_data(raw_df)
-            if export_to_csv(clean_df):
+            if export_to_csv(clean_df, "Money_Manager_Full_Export.csv"):
                 if update_sync_timestamp(raw_df['timestamp'].max()):
                     print("[INFO] Sync state established. Ready for future incremental runs.")
                 else:
@@ -310,13 +245,13 @@ def main():
             print("[ERROR] No data extracted from database.")
 
     elif choice == '2':
-        print("\n[INFO] Executing Incremental API Sync...")
+        print("\n[INFO] Executing New Transactions Export...")
         last_sync = get_last_sync_timestamp()
         
         if last_sync is None:
             print("[WARNING] No sync state found. Run Option 1 first to establish a baseline.")
-            if not get_yes_no_input("Proceed with full historical API sync? This is not recommended. (y/n): "):
-                print("[INFO] Sync cancelled.")
+            if not get_yes_no_input("Proceed with full historical export? (y/n): "):
+                print("[INFO] Export cancelled.")
                 return
 
         raw_df = extract_sql(DB_PATH, last_sync)
@@ -324,13 +259,13 @@ def main():
             print("[INFO] No new transactions detected. Pipeline up to date.")
         else:
             clean_df = transform_data(raw_df)
-            if load_to_notion(clean_df, FINANCE_DB_ID):
+            if export_to_csv(clean_df, "Money_Manager_New_Transactions.csv"):
                 if update_sync_timestamp(raw_df['timestamp'].max()):
                     print("[INFO] Sync state successfully updated.")
                 else:
-                    print("[WARNING] Transactions synced but sync state could not be saved.")
+                    print("[WARNING] CSV exported but sync state could not be saved.")
             else:
-                print("[ERROR] Failed to sync transactions to Notion.")
+                print("[ERROR] Failed to export transactions to CSV.")
 
     elif choice == '3':
         print("\n[INFO] Resetting Sync State...")
