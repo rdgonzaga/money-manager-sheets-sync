@@ -1,19 +1,29 @@
 import os
 import sqlite3
 import pandas as pd
+import gspread
 from dotenv import load_dotenv
 import time
 
 load_dotenv()
 DB_PATH = os.getenv("MM_DB_PATH")
-STATE_FILE = ".sync_state" 
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
+STATE_FILE = ".sync_state"
+SYNTHETIC_CATEGORIES = {"Transfer", "Uncategorized"}
 
 def validate_environment():
     errors = []
-    
+
     if not DB_PATH:
         errors.append("MM_DB_PATH not found in .env file")
-    
+
+    if not GOOGLE_SERVICE_ACCOUNT_FILE:
+        errors.append("GOOGLE_SERVICE_ACCOUNT_FILE not found in .env file")
+
+    if not GOOGLE_SHEETS_SPREADSHEET_ID:
+        errors.append("GOOGLE_SHEETS_SPREADSHEET_ID not found in .env file")
+
     if errors:
         print("[ERROR] Configuration validation failed:")
         for error in errors:
@@ -134,7 +144,7 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     df['date'] = pd.to_datetime(df['timestamp'] + 978307200, unit='s', errors='coerce')
     df['date'] = df['date'].dt.tz_localize('UTC').dt.tz_convert('Asia/Manila')
     
-    df['note'] = df['note'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Untitled Transaction')
+    df['note'] = df['note'].fillna('Untitled Transaction').astype(str).str.strip().replace(['', 'None', 'nan'], 'Untitled Transaction')
     
     is_transfer = df['type'].astype(str).isin(['3', '4'])
     df.loc[is_transfer, 'category_name'] = 'Transfer'
@@ -152,8 +162,8 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     
     df.loc[is_transfer, 'note'] = df[is_transfer].apply(enrich_transfer_note, axis=1)
     
-    df['category_name'] = df['category_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Uncategorized')
-    df['account_name'] = df['account_name'].astype(str).str.strip().replace(['', 'None', 'nan'], 'Unknown Account')
+    df['category_name'] = df['category_name'].fillna('Uncategorized').astype(str).str.strip().replace(['', 'None', 'nan'], 'Uncategorized')
+    df['account_name'] = df['account_name'].fillna('Unknown Account').astype(str).str.strip().replace(['', 'None', 'nan'], 'Unknown Account')
     
     type_map = {'0': 'Income', '1': 'Expense', '3': 'Transfer', '4': 'Transfer'}
     df['type'] = df['type'].astype(str).map(type_map).fillna('Other')
@@ -213,91 +223,222 @@ def export_setup_data(df: pd.DataFrame):
         print(f"[ERROR] Setup data export failed: {e}")
         return False
 
+def retry_with_backoff(fn, max_retries: int = 3, base_delay: int = 2):
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+
+def get_sheets_client():
+    try:
+        return gspread.service_account(filename=GOOGLE_SERVICE_ACCOUNT_FILE)
+    except Exception as e:
+        print(f"[ERROR] Google Sheets authentication failed: {e}")
+        print("[INFO] Check GOOGLE_SERVICE_ACCOUNT_FILE in your .env file.")
+        return None
+
+def get_worksheet(client, worksheet_name: str = "Transactions Log"):
+    try:
+        return retry_with_backoff(lambda: client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID).worksheet(worksheet_name))
+    except Exception as e:
+        print(f"[ERROR] Failed to open worksheet '{worksheet_name}': {e}")
+        print("[INFO] Check GOOGLE_SHEETS_SPREADSHEET_ID and that the sheet is shared with the service account.")
+        return None
+
+def get_setup_categories(client) -> set:
+    try:
+        rows = retry_with_backoff(lambda: client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID).worksheet("Setup").get_all_values())
+    except Exception as e:
+        print(f"[WARNING] Could not read Setup sheet to check for new categories: {e}")
+        return set()
+
+    categories = set()
+    for row in rows[1:]:
+        for value in row:
+            value = value.strip()
+            if value:
+                categories.add(value)
+    return categories
+
+def log_new_categories(categories: list, filename: str = "unbucketed_categories.log") -> bool:
+    if not categories:
+        return True
+
+    try:
+        already_logged = set()
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                already_logged = {line.strip() for line in f if line.strip()}
+
+        to_append = [c for c in categories if c not in already_logged]
+        if to_append:
+            with open(filename, "a") as f:
+                for category in to_append:
+                    f.write(category + "\n")
+        return True
+    except IOError as e:
+        print(f"[ERROR] Failed to persist new category warnings to {filename}: {e}")
+        return False
+
+def flag_new_categories(df: pd.DataFrame, known_categories: set):
+    seen = set(df['category_name'].unique()) - SYNTHETIC_CATEGORIES
+    new_categories = sorted(seen - known_categories)
+    for category in new_categories:
+        print(f"[WARNING] New category \"{category}\" not found in Setup sheet - add it to the correct bucket (Income/Fixed Expenses/Expense/Savings/Debts).")
+    if new_categories:
+        log_new_categories(new_categories)
+
+def filter_duplicate_rows(rows: list, existing_rows: list) -> list:
+    existing_keys = set()
+    for existing in existing_rows:
+        if len(existing) != 6:
+            continue
+        date, type_, account, category, amount, note = existing
+        try:
+            amount = round(float(amount), 2)
+        except ValueError:
+            continue
+        existing_keys.add((date, type_, account, category, amount, note))
+
+    return [
+        row for row in rows
+        if (row[0], row[1], row[2], row[3], round(float(row[4]), 2), row[5]) not in existing_keys
+    ]
+
+def push_to_sheet(worksheet, df: pd.DataFrame) -> bool:
+    ordered = df.sort_values('date', ascending=False)
+
+    rows = ordered.apply(lambda row: [
+        row['date'].strftime('%Y-%m-%d %H:%M'),
+        row['type'],
+        row['account_name'],
+        row['category_name'],
+        row['amount'],
+        row['note'],
+    ], axis=1).tolist()
+
+    try:
+        existing_rows = retry_with_backoff(lambda: worksheet.get_all_values())[2:]
+    except Exception as e:
+        print(f"[ERROR] Failed to read existing rows for duplicate check: {e}")
+        return False
+
+    new_rows = filter_duplicate_rows(rows, existing_rows)
+    skipped = len(rows) - len(new_rows)
+    if skipped:
+        print(f"[INFO] Skipped {skipped} row(s) already present in '{worksheet.title}'.")
+
+    if not new_rows:
+        print("[INFO] Nothing new to push after duplicate check.")
+        return True
+
+    try:
+        retry_with_backoff(lambda: worksheet.insert_rows(new_rows, row=3, value_input_option='USER_ENTERED'))
+        print(f"[SUCCESS] Pushed {len(new_rows)} records to '{worksheet.title}'.")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to push records to Google Sheets: {e}")
+        return False
+
 def main():
     if not validate_environment():
         return
-    
-    print("\n" + "="*50)
-    print(" Money Manager to Google Sheets ETL Pipeline")
-    print("="*50)
-    print("1. Full History Export (CSV)")
-    print("   - Extracts full historical data to CSV for initial setup.")
-    print("   - Establishes the sync state to track new records.")
-    print("\n2. New Transactions Export (CSV)")
-    print("   - Extracts only new transactions since the last run.")
-    print("\n3. Reset Sync State")
-    print("   - Deletes the local state file. Resets the pipeline to zero.")
-    print("\n4. Export Sheet Setup Data")
-    print("   - Extracts unique Types, Accounts, and Categories for Sheet setup.")
-    print("\n5. Exit")
-    print("="*50)
 
-    choice = get_menu_choice()
+    while True:
+        print("\n" + "="*50)
+        print(" Money Manager to Google Sheets ETL Pipeline")
+        print("="*50)
+        print("1. Full History Export (CSV)")
+        print("   - Extracts full historical data to CSV for initial setup.")
+        print("   - Establishes the sync state to track new records.")
+        print("\n2. New Transactions Sync (Google Sheets)")
+        print("   - Extracts new transactions since the last run and pushes them")
+        print("     directly into the 'Transactions Log' tab of your Google Sheet.")
+        print("\n3. Reset Sync State")
+        print("   - Deletes the local state file. Resets the pipeline to zero.")
+        print("\n4. Export Sheet Setup Data")
+        print("   - Extracts unique Types, Accounts, and Categories for Sheet setup.")
+        print("\n5. Exit")
+        print("="*50)
 
-    if choice == '1':
-        print("\n[INFO] Executing Full History Export...")
-        raw_df = extract_sql(DB_PATH)
-        if not raw_df.empty:
-            clean_df = transform_data(raw_df)
-            if export_to_csv(clean_df, "Money_Manager_Full_Export.csv"):
-                if update_sync_timestamp(raw_df['timestamp'].max()):
-                    print("[INFO] Sync state established. Ready for future incremental runs.")
+        choice = get_menu_choice()
+
+        if choice == '1':
+            print("\n[INFO] Executing Full History Export...")
+            raw_df = extract_sql(DB_PATH)
+            if not raw_df.empty:
+                clean_df = transform_data(raw_df)
+                if export_to_csv(clean_df, "Money_Manager_Full_Export.csv"):
+                    if update_sync_timestamp(raw_df['timestamp'].max()):
+                        print("[INFO] Sync state established. Ready for future incremental runs.")
+                    else:
+                        print("[WARNING] CSV exported but sync state could not be saved.")
                 else:
-                    print("[WARNING] CSV exported but sync state could not be saved.")
+                    print("[ERROR] CSV export failed.")
             else:
-                print("[ERROR] CSV export failed.")
-        else:
-            print("[ERROR] No data extracted from database.")
+                print("[ERROR] No data extracted from database.")
 
-    elif choice == '2':
-        print("\n[INFO] Executing New Transactions Export...")
-        last_sync = get_last_sync_timestamp()
-        
-        if last_sync is None:
-            print("[WARNING] No sync state found. Run Option 1 first to establish a baseline.")
-            if not get_yes_no_input("Proceed with full historical export? (y/n): "):
-                print("[INFO] Export cancelled.")
-                return
+        elif choice == '2':
+            print("\n[INFO] Executing New Transactions Sync...")
+            last_sync = get_last_sync_timestamp()
 
-        raw_df = extract_sql(DB_PATH, last_sync)
-        if raw_df.empty:
-            print("[INFO] No new transactions detected. Pipeline up to date.")
-        else:
-            clean_df = transform_data(raw_df)
-            if export_to_csv(clean_df, "Money_Manager_New_Transactions.csv"):
-                if update_sync_timestamp(raw_df['timestamp'].max()):
-                    print("[INFO] Sync state successfully updated.")
+            if last_sync is None:
+                print("[WARNING] No sync state found. Run Option 1 first to establish a baseline.")
+                if not get_yes_no_input("Proceed with full historical export? (y/n): "):
+                    print("[INFO] Export cancelled.")
+                    continue
+
+            raw_df = extract_sql(DB_PATH, last_sync)
+            if raw_df.empty:
+                print("[INFO] No new transactions detected. Pipeline up to date.")
+            else:
+                clean_df = transform_data(raw_df)
+
+                client = get_sheets_client()
+                worksheet = get_worksheet(client) if client else None
+
+                if worksheet is None:
+                    print("[ERROR] Sync aborted. Could not connect to Google Sheets.")
                 else:
-                    print("[WARNING] CSV exported but sync state could not be saved.")
+                    flag_new_categories(clean_df, get_setup_categories(client))
+                    if push_to_sheet(worksheet, clean_df):
+                        if update_sync_timestamp(raw_df['timestamp'].max()):
+                            print("[INFO] Sync state successfully updated.")
+                        else:
+                            print("[WARNING] Sheet updated but sync state could not be saved.")
+                    else:
+                        print("[ERROR] Failed to push transactions to Google Sheets.")
+
+        elif choice == '3':
+            print("\n[INFO] Resetting Sync State...")
+            if not get_yes_no_input("Are you sure? This will reset the sync state. (y/n): "):
+                print("[INFO] Reset cancelled.")
+                continue
+
+            try:
+                if os.path.exists(STATE_FILE):
+                    os.remove(STATE_FILE)
+                    print("[SUCCESS] Sync state cleared. Pipeline will treat database as new.")
+                else:
+                    print("[INFO] No active sync state file found.")
+            except Exception as e:
+                print(f"[ERROR] Failed to reset sync state: {e}")
+
+        elif choice == '4':
+            print("\n[INFO] Exporting Sheet Setup Data...")
+            raw_df = extract_sql(DB_PATH)
+            if not raw_df.empty:
+                clean_df = transform_data(raw_df)
+                export_setup_data(clean_df)
             else:
-                print("[ERROR] Failed to export transactions to CSV.")
+                print("[ERROR] No data extracted from database.")
 
-    elif choice == '3':
-        print("\n[INFO] Resetting Sync State...")
-        if not get_yes_no_input("Are you sure? This will reset the sync state. (y/n): "):
-            print("[INFO] Reset cancelled.")
-            return
-        
-        try:
-            if os.path.exists(STATE_FILE):
-                os.remove(STATE_FILE)
-                print("[SUCCESS] Sync state cleared. Pipeline will treat database as new.")
-            else:
-                print("[INFO] No active sync state file found.")
-        except Exception as e:
-            print(f"[ERROR] Failed to reset sync state: {e}")
-
-    elif choice == '4':
-        print("\n[INFO] Exporting Sheet Setup Data...")
-        raw_df = extract_sql(DB_PATH)
-        if not raw_df.empty:
-            clean_df = transform_data(raw_df)
-            export_setup_data(clean_df)
-        else:
-            print("[ERROR] No data extracted from database.")
-
-    elif choice == '5':
-        print("[INFO] Exiting pipeline.")
+        elif choice == '5':
+            print("[INFO] Exiting pipeline.")
+            break
 
 if __name__ == "__main__":
     try:

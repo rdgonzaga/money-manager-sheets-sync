@@ -1,13 +1,17 @@
 # Security
 .env
+*.json
 
 # Data Files & State
 *.mmbak
 *.sqlite
 *.csv
+*.xlsx
 .sync_state
+unbucketed_categories.log
 
 # Python Environments
 .venv/
 venv/
 __pycache__/
+.pytest_cache/
