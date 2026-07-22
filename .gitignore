@@ -1,14 +1,11 @@
 # Security
 .env
-*.json
+credentials/
 
 # Data Files & State
-*.mmbak
-*.sqlite
-*.csv
-*.xlsx
-.sync_state
-unbucketed_categories.log
+data/
+output/
+logs/
 
 # Python Environments
 .venv/

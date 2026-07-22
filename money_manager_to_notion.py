@@ -9,7 +9,7 @@ load_dotenv()
 DB_PATH = os.getenv("MM_DB_PATH")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
-STATE_FILE = ".sync_state"
+STATE_FILE = os.path.join("data", ".sync_state")
 SYNTHETIC_CATEGORIES = {"Transfer", "Uncategorized"}
 
 def validate_environment():
@@ -80,6 +80,7 @@ def update_sync_timestamp(new_timestamp: float):
         return False
     
     try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w") as f:
             f.write(str(new_timestamp))
         return True
@@ -175,11 +176,11 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
         
     return df
 
-def export_to_csv(df: pd.DataFrame, filename: str = "Money_Manager_Export.csv"):
+def export_to_csv(df: pd.DataFrame, filename: str = os.path.join("output", "Money_Manager_Export.csv")):
     df_csv = df.drop(columns=['timestamp'])
-    
+
     df_csv['date'] = df_csv['date'].dt.strftime('%Y-%m-%d %H:%M')
-    
+
     df_csv = df_csv.rename(columns={
         'date': 'DATE',
         'type': 'TYPE',
@@ -188,11 +189,12 @@ def export_to_csv(df: pd.DataFrame, filename: str = "Money_Manager_Export.csv"):
         'amount': 'AMOUNT',
         'note': 'DETAILS / NAME'
     })
-    
+
     column_order = ['DATE', 'TYPE', 'ACCOUNT', 'CATEGORY', 'AMOUNT', 'DETAILS / NAME']
     df_csv = df_csv[column_order]
-    
+
     try:
+        os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
         df_csv.to_csv(filename, index=False)
         print(f"[SUCCESS] Exported {len(df_csv)} records to {filename}")
         print("[INFO] Next Step: Import this file into your Google Sheets budget tracker.")
@@ -214,8 +216,9 @@ def export_setup_data(df: pd.DataFrame):
         'UNIQUE CATEGORIES': categories + [''] * (max_len - len(categories))
     })
     
-    filename = "Sheet_Setup_Data.csv"
+    filename = os.path.join("output", "Sheet_Setup_Data.csv")
     try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         setup_df.to_csv(filename, index=False)
         print(f"[SUCCESS] Exported unique lists to {filename}")
         return True
@@ -263,7 +266,7 @@ def get_setup_categories(client) -> set:
                 categories.add(value)
     return categories
 
-def log_new_categories(categories: list, filename: str = "unbucketed_categories.log") -> bool:
+def log_new_categories(categories: list, filename: str = os.path.join("logs", "unbucketed_categories.log")) -> bool:
     if not categories:
         return True
 
@@ -275,6 +278,7 @@ def log_new_categories(categories: list, filename: str = "unbucketed_categories.
 
         to_append = [c for c in categories if c not in already_logged]
         if to_append:
+            os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
             with open(filename, "a") as f:
                 for category in to_append:
                     f.write(category + "\n")
@@ -371,7 +375,7 @@ def main():
             raw_df = extract_sql(DB_PATH)
             if not raw_df.empty:
                 clean_df = transform_data(raw_df)
-                if export_to_csv(clean_df, "Money_Manager_Full_Export.csv"):
+                if export_to_csv(clean_df, os.path.join("output", "Money_Manager_Full_Export.csv")):
                     if update_sync_timestamp(raw_df['timestamp'].max()):
                         print("[INFO] Sync state established. Ready for future incremental runs.")
                     else:
