@@ -12,3 +12,6 @@ logs/
 venv/
 __pycache__/
 .pytest_cache/
+/.vscode
+CLAUDE.md
+IMPROVEMENTS.md
