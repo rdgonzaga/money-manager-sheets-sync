@@ -61,10 +61,33 @@ The sync pushes rows directly into your sheet using a **service account** — a 
 
 ## 3. Usage
 
-Run the script:
+### Run from source
 ```bash
 python money_manager_to_notion.py
 ```
+
+### Run as a standalone executable (Windows)
+
+A pre-built `.exe` can be generated with [PyInstaller](https://pyinstaller.org/) so you don't need Python installed to run it.
+
+**Build the executable** (one-time, or after any code change):
+```bash
+pip install pyinstaller
+pyinstaller --onefile --name money-manager-sync money_manager_to_notion.py
+```
+
+The output will be at `dist\money-manager-sync.exe`. Before running it, copy the required files next to the executable:
+
+```
+dist/
+  money-manager-sync.exe
+  .env
+  credentials/        ← copy the whole folder
+```
+
+Then simply double-click `money-manager-sync.exe` or run it from a terminal. The `data/`, `output/`, and `logs/` folders will be created automatically on first run.
+
+> **Note:** `build/`, `dist/`, and `*.spec` are gitignored — only the source script is tracked.
 
 You'll see an interactive menu with 5 options. After each operation finishes, the menu redisplays so you can run another one without restarting the script.
 

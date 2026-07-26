@@ -12,6 +12,12 @@ logs/
 venv/
 __pycache__/
 .pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
 /.vscode
 CLAUDE.md
 IMPROVEMENTS.md
