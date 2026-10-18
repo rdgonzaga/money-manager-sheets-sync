@@ -1,6 +1,7 @@
 # Security
 .env
 credentials/
+.mcp.json
 
 # Data Files & State
 data/
@@ -21,3 +22,6 @@ dist/
 /.vscode
 CLAUDE.md
 IMPROVEMENTS.md
+
+# Local sheet backups (contain personal financial data)
+backups/
